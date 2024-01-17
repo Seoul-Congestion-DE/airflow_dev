@@ -1,23 +1,21 @@
 from airflow import DAG
 from airflow.decorators import task
+from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from contextlib import closing
-from snowflake.connector import connect
 import pendulum
 import requests
 import json
 import os
 import logging
 from dotenv import load_dotenv
+from airflow.operators.dagrun_operator import TriggerDagRunOperator
 
 load_dotenv()  # .env 파일 로드
 
-user = os.getenv('SNOWFLAKE_USER')
-password = os.getenv('SNOWFLAKE_PASSWORD')
-account = os.getenv('SNOWFLAKE_ACCOUNT')
-warehouse = os.getenv('SNOWFLAKE_WAREHOUSE')
-database = os.getenv('SNOWFLAKE_DATABASE')
-schema = os.getenv('SNOWFLAKE_SCHEMA')
 seoul_api_key = os.getenv('SEOUL_API_KEY')
+
+# Snowflake 연결 ID를 지정합니다.
+SNOWFLAKE_CONN_ID = 'snowflake'
 
 # 지역 리스트
 locations = [
@@ -136,78 +134,83 @@ locations = [
     "청와대"
 ]
 
-def get_Snowflake_connection():
-    conn = connect(
-        user=user,
-        password=password,
-        account=account,
-        warehouse=warehouse,
-        database=database,
-        schema=schema
-    )
-    return conn
-
 @task
 def extract():
     responses = []
-    for location in locations:
-        url = f'http://openapi.seoul.go.kr:8088/{seoul_api_key}/json/citydata_ppltn/1/5/{location}'
-        response = requests.get(url)
-        responses.append(response.content.decode('utf-8'))
-
-    logging.info(f'Responses: {responses}')
-    return responses
-
+    try:
+        for location in locations:
+            url = f'http://openapi.seoul.go.kr:8088/{seoul_api_key}/json/citydata_ppltn/1/5/{location}'
+            response = requests.get(url)
+            responses.append(response.content.decode('utf-8'))
+    except Exception as e:
+        logging.error(f"Error occurred while extracting data: {e}")
+        raise
+    else:
+        logging.info(f'Responses: {responses}')
+        return responses
+    
 @task
 def transform(json_strs):
     data_list = []
-    for json_str in json_strs:
-        data = json.loads(json_str)
-        try:
-            records = list(data['SeoulRtd.citydata_ppltn'][0].values())
-        except KeyError:
-            print("'SeoulRtd.citydata_ppltn' key not found in data")
-        is_prediction = True if records[-2] == "Y" else False
-        data_list.append({'records': records, 'is_prediction': is_prediction})
-    return data_list
+    try:
+        for json_str in json_strs:
+            data = json.loads(json_str)
+            try:
+                records = list(data['SeoulRtd.citydata_ppltn'][0].values())
+            except KeyError:
+                logging.error("'SeoulRtd.citydata_ppltn' key not found in data", data)
+                continue
+            is_prediction = True if records[-2] == "Y" else False
+            data_list.append({'records': records, 'is_prediction': is_prediction})
+    except Exception as e:
+        logging.error(f"Error occurred while transforming data: {e}")
+        raise
+    else:
+        return data_list
 
 @task
 def load(table, pre_table, data_list):
-    conn = get_Snowflake_connection()
-    with closing(conn.cursor()) as cur:
-        try:
-            # Full refresh by deleting existing data
-            cur.execute(f"DELETE FROM {table};")
-            cur.execute(f"DELETE FROM {pre_table};")
-            
-            # Start the transaction
-            cur.execute("BEGIN;")
-            
-            for data in data_list:
-                records = data['records']
-                is_prediction = data['is_prediction']
+    try:
+        hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+        conn = hook.get_conn()
+        with closing(conn.cursor()) as cur:
+            try:
+                # Full refresh by deleting existing data
+                cur.execute(f"DELETE FROM DEV.RAW_DATA.{table};")
+                cur.execute(f"DELETE FROM DEV.RAW_DATA.{pre_table};")
                 
-                values = ', '.join(f"'{record}'" if isinstance(record, str) else str(record) for record in records[:-1])
-                if is_prediction:
-                    for p in records[-1]:
-                        area_code = f"'{records[1]}', "
-                        pre_values = area_code + ', '.join(f"'{value}'" if isinstance(value, str) else str(value) for value in p.values())
-                        sql = f"INSERT INTO {pre_table} VALUES ({pre_values})"
-                        cur.execute(sql)
-                sql = f"INSERT INTO {table} VALUES ({values})"
-                cur.execute(sql)
+                # Start the transaction
+                cur.execute("BEGIN;")
                 
-            # Commit the transaction
-            cur.execute("COMMIT;")
-        except Exception as error:
-            print(f"Failed to load data to {table}", error)
-            cur.execute("ROLLBACK;")
+                for data in data_list:
+                    records = data['records']
+                    is_prediction = data['is_prediction']
+                    
+                    values = ', '.join(f"'{record}'" if isinstance(record, str) else str(record) for record in records[:-1])
+                    if is_prediction:
+                        for p in records[-1]:
+                            area_code = f"'{records[0]}', "
+                            pre_values = area_code + ', '.join(f"'{value}'" if isinstance(value, str) else str(value) for value in p.values())
+                            sql = f"INSERT INTO DEV.RAW_DATA.{pre_table} VALUES ({pre_values})"
+                            cur.execute(sql)
+                    sql = f"INSERT INTO DEV.RAW_DATA.{table} VALUES ({values})"
+                    cur.execute(sql)
+                    
+                # Commit the transaction
+                cur.execute("COMMIT;")
+            except Exception as e:
+                logging.error(f"Error occurred while loading data to {table}", e)
+                cur.execute("ROLLBACK;")
+                raise
+    except Exception as e:
+        logging.error(f"Error occurred while connecting to Snowflake: {e}")
+        raise
 
 with DAG(
     dag_id='citydata_ppltn_v1',
     start_date=pendulum.yesterday(),
     # Schedule to run every hour
-    schedule_interval='@hourly',
+    schedule_interval= None,
 ) as dag:
     
     # 직접 작성
@@ -219,3 +222,18 @@ with DAG(
     load_data = load(table_name, pre_table_name, transformed_data)
 
     extracted_data >> transformed_data >> load_data
+
+    trigger_dag1 = TriggerDagRunOperator(
+        task_id='trigger_dag1',
+        trigger_dag_id="extract_and_append_to_existing_table",
+        dag=dag
+    )
+
+    trigger_dag2 = TriggerDagRunOperator(
+        task_id='trigger_dag2',
+        trigger_dag_id="congestion_analytics_dag",
+        dag=dag
+    )
+
+    load_data >> trigger_dag1
+    load_data >> trigger_dag2
